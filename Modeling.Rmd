@@ -1,0 +1,342 @@
+---
+title: "Appendix (Modeling)"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(readxl)
+library(lmtest)
+library(car)
+library(glmnet)
+library(tree)
+library(randomForest)
+library(pls)
+library(caret)
+library(gbm)
+```
+
+# 0. Data cleaning and take logs
+```{r}
+# Load dataset
+data = read.csv("winequality-red.csv")
+data = na.omit(data)
+
+# Take log
+data$fixed.acidity = log(data$fixed.acidity)
+data$residual.sugar = log(data$residual.sugar)
+data$free.sulfur.dioxide = log(data$free.sulfur.dioxide)
+data$total.sulfur.dioxide = log(data$total.sulfur.dioxide)
+
+# Check NAs
+data = na.omit(data)
+
+# Split the data set into training and testing
+train = sample(1:nrow(data), size=0.7*nrow(data))
+test = -train
+data_train = data[train, ]
+data_test = data[test, ]
+```
+
+# 1. Predicting quality
+## 1.1. Linear Regression
+```{r}
+# Perform Linear Regression
+linear <- lm(quality~., data=data)
+summary(linear)
+
+# Check assumptions:
+# 1. Linearity/functional form
+plot(linear$fitted.values, linear$residuals, 
+     main = "Residual vs. Fitted values of linear model", 
+     xlab = "Fitted Values", ylab = "Residuals")
+abline(0,0)
+# 2. Normality
+hist(linear$residuals, xlab = "Residuals", main="Residual Histogram")
+qqnorm(linear$residuals, frame=FALSE, xlab = "Residuals", main="QQ-Plot for Residuals")
+qqline(linear$residuals, col="steelblue", lwd=2)
+shapiro.test(linear$residuals)
+ks.test(linear$residuals, "pnorm")
+# 3. Homoscedasticity: exists
+bptest(linear)
+# 4. Uncorrelated error
+dwtest(formula=linear, alternative="two.sided")
+
+# Check mlticollinearity
+vif(linear)
+```
+
+## 1.2. Principal Component Regression
+```{r}
+# Data preprocessing
+xtrain = model.matrix(quality~., data_train)[,-12]
+ytrain = data_train$quality
+xtest = model.matrix(quality~., data_test)[,-12]
+ytest = data_test$quality
+
+# Perform PCR
+pcr_model <- pcr(quality~., data=data_train, scale=TRUE, validation="CV")
+summary(pcr_model)
+validationplot(pcr_model) # ncomp = 9 may be the best choice
+pcr_pred = predict(pcr_model, data_test, ncomp=9)
+
+# Plot Residuals
+residuals_pcr <- ytest - pcr_pred
+plot(ytest, residuals_pcr, main = "PCR Residuals vs. Observed", 
+     xlab = "Observed Values", ylab = "Residuals")
+
+mean(abs(pcr_pred - ytest)) # MAE of PCR model
+mean((pcr_pred - ytest)^2) # MSE of PCR model
+```
+
+## 1.3. Lasso
+```{r}
+cv_out <- cv.glmnet(xtrain, ytrain, alpha=1)
+lasso_lambda <- cv_out$lambda.min
+plot(cv_out) 
+lasso_model <- glmnet(xtrain, ytrain, alpha=1, lambda=lasso_lambda)
+coef(lasso_model)
+lasso_pred = predict(lasso_model, s=lasso_lambda, newx=xtest)
+
+# Plot Residuals
+residuals_lasso <- ytest - lasso_pred
+plot(ytest, residuals_lasso, main = "Lasso Residuals vs. Observed", 
+     xlab = "Observed Values", ylab = "Residuals")
+
+mean(abs(lasso_pred - ytest)) # MAE of lasso model
+mean((lasso_pred - ytest)^2) # MSE of lasso model
+```
+
+## 1.4. Ridge
+```{r}
+cv_out_2 <- cv.glmnet(xtrain, ytrain, alpha=0)
+ridge_lambda <- cv_out_2$lambda.min
+plot(cv_out_2)
+ridge_model <- glmnet(xtrain, ytrain, alpha=0, lambda=ridge_lambda)
+coef(ridge_model)
+ridge_pred = predict(ridge_model, s=ridge_lambda, newx=xtest)
+
+# Plot Residuals
+residuals_ridge <- ytest - ridge_pred
+plot(ytest, residuals_ridge, main = "Ridge Residuals vs. Observed", 
+     xlab = "Observed Values", ylab = "Residuals")
+
+mean(abs(ridge_pred - ytest)) # MAE of ridge model
+mean((ridge_pred - ytest)^2) # MSE of ridge model
+```
+
+## 1.5. Random Forest
+```{r}
+# Bagging (first model used all 11 variables)
+rf_data = randomForest(quality~., data=data, subset=train, mtry=11, importance =TRUE)
+rf_data
+
+# Make predictions
+yhat_rf = predict(rf_data, newdata=data_test)
+plot(yhat_rf, data_test$quality, xlab = "Predicted Values", 
+     ylab = "Real Values", main = "Predicted Values vs. Real Values")
+abline(0,1)
+mse_rf11 = mean((yhat_rf-data_test$quality)^2) # MSE
+mse_rf11
+```
+
+```{r}
+# Use mtry=5 to compare models
+rf_data2 = randomForest(quality~.,data=data, subset=train, mtry=5, importance=TRUE)
+rf_data2
+yhat_rf2 = predict(rf_data2, newdata=data_test)
+mse_rf5 = mean((yhat_rf2-data_test$quality)^2) # MSE
+mse_rf5
+
+importance(rf_data2)
+varImpPlot(rf_data2)
+```
+
+
+
+# 2. Classification models: Logistic, Elastic Net, & Boosting
+## 2.0. Data processing
+```{r}
+# Define high quality
+high = ifelse(data$quality>=6, 1, 0)
+data = data.frame(data, high)
+data = data[, -12]
+
+high = ifelse(data_train$quality>=6, 1, 0)
+data_train = data.frame(data_train, high)
+data_train = data_train[, -12]
+
+high = ifelse(data_test$quality>=6, 1, 0)
+data_test = data.frame(data_test, high)
+data_test = data_test[, -12]
+
+# Visualization of new variable
+hist(data$high)
+hist(data_train$high)
+```
+
+## 2.1. Logistic
+```{r}
+# Logistic
+logistic = glm(high~., family = "binomial", data = data)
+summary(logistic)
+
+# Logistic Training and Confusion Matrix
+intraining <- createDataPartition(data$high, p = 0.75, list = FALSE)
+training <- data[intraining,]
+testing <- data[-intraining,]
+train_control <- trainControl(method = "cv", number = 5)
+
+logistic_training <- train(as.factor(high)~., 
+                           data = training, 
+                           method = "glm", 
+                           family = "binomial"(link = "logit"), 
+                           trControl = train_control)
+summary(logistic_training)
+
+pred_high <- predict(logistic_training, newdata = testing)
+conf_matrix <- confusionMatrix(data = pred_high, reference = as.factor(testing$high))
+conf_matrix
+```
+
+```{r}
+# Further Analysis of Logistic
+# F1-score
+# Extract TP, FP, TN, FN from confusion matrix
+TP <- conf_matrix[["byClass"]]["Pos Pred Value"]
+FP <- conf_matrix[["byClass"]]["Neg Pred Value"]
+FN <- conf_matrix[["byClass"]]["Pos Pred Value"]
+TN <- conf_matrix[["byClass"]]["Neg Pred Value"]
+
+# Calculate precision, recall, and F1 score
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1_score_logistic <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_logistic)
+
+# VIF
+barplot(vif(logistic), main = "VIF Values", col = "skyblue3", ylim = c(0,15))
+abline(h = 4, lwd = 3, lty = 2, col = "red4")
+abline(h = 10, lwd = 3, lty = 2, col = "gold4")
+```
+
+## 2.2. Elastic Net
+```{r}
+# Data Preprocessing
+xtrain = model.matrix(high~., data_train)[,-12]
+ytrain = data_train$high
+xtest = model.matrix(high~., data_test)[,-12]
+ytest = data_test$high
+```
+
+```{r}
+# Elastic Net: alpha = 0.2
+elastic_model1 = glmnet(xtrain, ytrain, alpha=0.2)
+elastic_lambda1 = cv.glmnet(xtrain, ytrain, alpha=0.2)$lambda.min
+elastic_pred1 = predict(elastic_model1, s=elastic_lambda1, newx=xtest)
+binary_predictions1 <- ifelse(elastic_pred1 > 0.5, 1, 0)
+
+# Elastic Net: alpha = 0.5
+elastic_model2 = glmnet(xtrain, ytrain, alpha=0.5)
+elastic_lambda2 = cv.glmnet(xtrain, ytrain, alpha=0.5)$lambda.min
+elastic_pred2 = predict(elastic_model2, s=elastic_lambda2, newx=xtest)
+binary_predictions2 <- ifelse(elastic_pred1 > 0.5, 1, 0)
+
+# Elastic Net: alpha = 0.8
+elastic_model3 = glmnet(xtrain, ytrain, alpha=0.8)
+elastic_lambda3 = cv.glmnet(xtrain, ytrain, alpha=0.8)$lambda.min
+elastic_pred3 = predict(elastic_model3, s=elastic_lambda3, newx=xtest)
+binary_predictions3 <- ifelse(elastic_pred1 > 0.5, 1, 0)
+```
+
+```{r}
+# Print results
+# MAE
+mean(abs(binary_predictions1 - ytest))
+mean(abs(binary_predictions2 - ytest))
+mean(abs(binary_predictions3 - ytest))
+
+# MSE
+mean((binary_predictions1 - ytest)^2)
+mean((binary_predictions2 - ytest)^2)
+mean((binary_predictions3 - ytest)^2)
+
+# F1-score
+conf_matrix <- table(binary_predictions1, ytest)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score_elastic1 <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_elastic1)
+
+conf_matrix <- table(binary_predictions2, ytest)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score_elastic2 <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_elastic2)
+
+conf_matrix <- table(binary_predictions3, ytest)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score_elastic3 <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_elastic3)
+```
+
+## 2.3. Boosting
+```{r}
+boost_data = gbm(high~., data=data_train, distribution="gaussian", 
+                 n.trees=5000, interaction.depth=4)
+summary(boost_data)
+plot(boost_data, i="alcohol", ylab = "Level of quality")
+plot(boost_data, i="sulphates", ylab = "Level of quality")
+plot(boost_data, i="volatile.acidity", ylab = "Level of quality")
+
+yhat_boost = predict(boost_data, newdata=data_test, n.trees=5000)
+yhat_boost_binary <- ifelse(yhat_boost > 0.5, 1, 0)
+table(yhat_boost_binary, data_test$high)
+
+# F1-score
+conf_matrix <- table(yhat_boost_binary, data_test$high)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score_boosting1 <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_boosting1)
+```
+
+```{r}
+# Fit a different learning rate
+boost_data2 = gbm(high~., data=data_train, distribution="gaussian", 
+                  n.trees=5000, interaction.depth=4, shrinkage=0.1, verbose=F)
+summary(boost_data2)
+
+plot(boost_data2, i="alcohol", ylab = "Level of quality")
+plot(boost_data2, i="sulphates", ylab = "Level of quality")
+plot(boost_data2, i="volatile.acidity", ylab = "Level of quality")
+
+yhat_boost2 = predict(boost_data2, newdata=data_test, n.trees=5000)
+yhat_boost_binary2 <- ifelse(yhat_boost2 > 0.5, 1, 0)
+table(yhat_boost_binary2, data_test$high)
+
+# F1-score
+conf_matrix <- table(yhat_boost_binary2, data_test$high)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+recall <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+f1_score_boosting2 <- 2 * (precision * recall) / (precision + recall)
+print(f1_score_boosting2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
